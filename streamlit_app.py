@@ -1,5 +1,14 @@
-# streamlit_app.py  ─ Streamlit 배포용 (Gemma-4 HF Router 통합)
-# 실행: streamlit run streamlit_app.py
+# streamlit_app.py  ─ Streamlit Cloud 배포용 (Secrets 자동 로드)
+# ============================================================
+#  Streamlit Cloud > App Settings > Secrets 에 아래 형식으로 입력:
+#
+#  LLM_ENGINE      = "hf_api"
+#  HF_TOKEN        = "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+#  HF_MODEL_ID     = "google/gemma-4-26B-A4B-it"
+#  HF_MAX_TOKENS   = "1200"
+#  HF_TEMPERATURE  = "0.2"
+#
+#  로컬 실행 시: .streamlit/secrets.toml 에 동일 내용 저장
 # ============================================================
 
 import sys, os
@@ -14,14 +23,45 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# ── Secrets → 환경변수 주입 (앱 최상단에서 처리) ──────────────
+def _load_secrets():
+    """
+    Streamlit Cloud Secrets 또는 .streamlit/secrets.toml 에서
+    HF 설정을 읽어 os.environ 및 session_state 에 주입.
+    없으면 os.environ 직접 참조 (로컬 export 방식 대응).
+    """
+    mapping = {
+        "HF_TOKEN":       "HF_TOKEN",
+        "HF_MODEL_ID":    "HF_MODEL_ID",
+        "HF_MAX_TOKENS":  "HF_MAX_TOKENS",
+        "HF_TEMPERATURE": "HF_TEMPERATURE",
+        "LLM_ENGINE":     "LLM_ENGINE",
+    }
+    for secret_key, env_key in mapping.items():
+        # 1순위: st.secrets
+        try:
+            val = st.secrets[secret_key]
+            os.environ[env_key] = str(val)
+        except Exception:
+            pass  # 없으면 기존 os.environ 유지
+
+_load_secrets()
+
+# ── 이제 llm_analyst import (환경변수 주입 후) ─────────────────
 from agent import KoreaSurgeAgent
 from models.llm_analyst import (
     analyze_stock_with_gemma,
     analyze_top10_with_gemma,
     chat_with_gemma,
     test_connection,
-    HF_MODEL,
 )
+
+# Secrets에서 읽은 값으로 모델명/파라미터 확정
+HF_MODEL       = os.environ.get("HF_MODEL_ID",    "google/gemma-4-26B-A4B-it")
+HF_MAX_TOKENS  = int(os.environ.get("HF_MAX_TOKENS",  "1200"))
+HF_TEMPERATURE = float(os.environ.get("HF_TEMPERATURE", "0.2"))
+_RAW_TOKEN     = os.environ.get("HF_TOKEN", "")
+
 
 # ── 페이지 설정 ────────────────────────────────────────────────
 st.set_page_config(
@@ -76,10 +116,14 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', sans-serif; }
     border: 1px solid #7c3aed55; border-radius: 12px;
     padding: 1.2rem 1.4rem; margin-top: .8rem;
 }
-.gemma-header { font-size:.8rem; color:#a78bfa; font-weight:700;
-                text-transform:uppercase; letter-spacing:.08em; margin-bottom:.5rem; }
-.conn-ok  { color:#22c55e; font-weight:700; }
-.conn-err { color:#ef4444; font-weight:700; }
+.gemma-header {
+    font-size:.8rem; color:#a78bfa; font-weight:700;
+    text-transform:uppercase; letter-spacing:.08em; margin-bottom:.5rem;
+}
+.secret-ok  { background:#16a34a18; border:1px solid #22c55e44;
+              border-radius:8px; padding:.5rem .8rem; font-size:.82rem; color:#22c55e; }
+.secret-err { background:#dc262618; border:1px solid #ef444444;
+              border-radius:8px; padding:.5rem .8rem; font-size:.82rem; color:#ef4444; }
 
 .chat-user { background:#1e293b; border-radius:10px; padding:.7rem 1rem;
              margin:.4rem 0; border-left:3px solid #60a5fa; }
@@ -91,7 +135,7 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', sans-serif; }
 """, unsafe_allow_html=True)
 
 
-# ── 헬퍼 ──────────────────────────────────────────────────────
+# ── 헬퍼 함수 ─────────────────────────────────────────────────
 def dir_badge(d):
     cls  = {"상승":"badge-up","하락":"badge-down","중립":"badge-neu"}.get(d,"badge-neu")
     icon = {"상승":"📈","하락":"📉","중립":"➡️"}.get(d,"")
@@ -108,18 +152,34 @@ def mc(label, value, sub="", color_class=""):
   <div class="metric-sub">{sub}</div>
 </div>"""
 
-@st.cache_resource(show_spinner="종목 목록 로딩 중…")
+def get_token() -> str:
+    """유효 토큰 반환: Secrets > session_state > 환경변수 순"""
+    return (
+        st.session_state.get("hf_token_override")  # 사이드바 수동 입력 (폴백용)
+        or _RAW_TOKEN
+        or ""
+    )
+
+def is_gemma_ready() -> bool:
+    return st.session_state.get("gemma_ok", False)
+
+
+# ── Agent 캐시 ─────────────────────────────────────────────────
+@st.cache_resource(show_spinner="📋 KOSPI/KOSDAQ 종목 목록 로딩 중…")
 def get_agent():
     return KoreaSurgeAgent(verbose=False)
 
-def hf_token() -> str:
-    return st.session_state.get("hf_token", "")
 
-def has_token() -> bool:
-    return bool(hf_token())
+# ── Gemma-4 자동 초기화 (앱 시작 시 1회) ──────────────────────
+@st.cache_resource(show_spinner="🤖 Gemma-4 연결 테스트 중…")
+def init_gemma(token: str):
+    """토큰이 있으면 자동 연결 테스트 후 결과 반환"""
+    if not token:
+        return {"success": False, "error": "토큰 없음", "reply": ""}
+    return test_connection(token)
 
 
-# ── 차트 ──────────────────────────────────────────────────────
+# ── 차트 함수들 ────────────────────────────────────────────────
 def plot_candle(raw, result):
     df = raw.tail(90).copy()
     df["date"] = pd.to_datetime(df["date"])
@@ -144,31 +204,29 @@ def plot_candle(raw, result):
     c2 = feat["close"]
     bm = c2.rolling(20).mean(); bs = c2.rolling(20).std()
     fig.add_trace(go.Scatter(x=fdates, y=bm+2*bs,
-        line=dict(color="#475569",width=.8,dash="dash"), name="BB상단", opacity=.5), row=1,col=1)
+        line=dict(color="#475569",width=.8,dash="dash"), name="BB상단",opacity=.5),row=1,col=1)
     fig.add_trace(go.Scatter(x=fdates, y=bm-2*bs,
         line=dict(color="#475569",width=.8,dash="dash"), name="BB하단",
-        fill="tonexty", fillcolor="rgba(71,85,105,0.06)", opacity=.5), row=1,col=1)
+        fill="tonexty", fillcolor="rgba(71,85,105,0.06)",opacity=.5),row=1,col=1)
 
     colors = ["#22c55e" if c>=o else "#ef4444"
               for c,o in zip(df["close"], df["open"])]
-    fig.add_trace(go.Bar(x=df["date"], y=df["volume"],
-        marker_color=colors, name="거래량", opacity=.7), row=2, col=1)
+    fig.add_trace(go.Bar(x=df["date"],y=df["volume"],
+        marker_color=colors,name="거래량",opacity=.7),row=2,col=1)
 
     if "rsi14" in feat.columns:
-        fig.add_trace(go.Scatter(x=fdates, y=feat["rsi14"],
-            line=dict(color="#f59e0b",width=1.5), name="RSI14"), row=3, col=1)
-        fig.add_hline(y=70, line_dash="dot", line_color="#ef4444", opacity=.5, row=3, col=1)
-        fig.add_hline(y=30, line_dash="dot", line_color="#22c55e", opacity=.5, row=3, col=1)
+        fig.add_trace(go.Scatter(x=fdates,y=feat["rsi14"],
+            line=dict(color="#f59e0b",width=1.5),name="RSI14"),row=3,col=1)
+        fig.add_hline(y=70,line_dash="dot",line_color="#ef4444",opacity=.5,row=3,col=1)
+        fig.add_hline(y=30,line_dash="dot",line_color="#22c55e",opacity=.5,row=3,col=1)
 
-    fig.update_layout(
-        height=520, paper_bgcolor="#0f172a", plot_bgcolor="#0f172a",
+    fig.update_layout(height=520, paper_bgcolor="#0f172a", plot_bgcolor="#0f172a",
         font=dict(color="#94a3b8",size=11), xaxis_rangeslider_visible=False,
         legend=dict(orientation="h",y=1.02,bgcolor="rgba(0,0,0,0)"),
-        margin=dict(l=10,r=10,t=40,b=10)
-    )
+        margin=dict(l=10,r=10,t=40,b=10))
     for i in range(1,4):
-        fig.update_xaxes(gridcolor="#1e293b", row=i, col=1)
-        fig.update_yaxes(gridcolor="#1e293b", row=i, col=1)
+        fig.update_xaxes(gridcolor="#1e293b",row=i,col=1)
+        fig.update_yaxes(gridcolor="#1e293b",row=i,col=1)
     return fig
 
 
@@ -180,39 +238,55 @@ def plot_gauge(pred_ret, conf_band):
                "increasing":{"color":"#22c55e"},"decreasing":{"color":"#ef4444"}},
         number={"suffix":"%","font":{"size":30,"color":color}},
         gauge={
-            "axis":{"range":[-15,15],"tickcolor":"#475569","tickfont":{"color":"#94a3b8","size":10}},
-            "bar":{"color":color,"thickness":.25},"bgcolor":"#1e293b","bordercolor":"#334155",
-            "steps":[{"range":[-15,-5],"color":"#2d1b1b"},{"range":[-5,0],"color":"#1f1818"},
-                     {"range":[0,5],"color":"#172117"},{"range":[5,15],"color":"#0f2a17"}],
-            "threshold":{"line":{"color":"#f59e0b","width":2},"thickness":.7,"value":pred_ret},
+            "axis":{"range":[-15,15],"tickcolor":"#475569",
+                    "tickfont":{"color":"#94a3b8","size":10}},
+            "bar":{"color":color,"thickness":.25},
+            "bgcolor":"#1e293b","bordercolor":"#334155",
+            "steps":[{"range":[-15,-5],"color":"#2d1b1b"},
+                     {"range":[-5,0],"color":"#1f1818"},
+                     {"range":[0,5],"color":"#172117"},
+                     {"range":[5,15],"color":"#0f2a17"}],
+            "threshold":{"line":{"color":"#f59e0b","width":2},
+                         "thickness":.7,"value":pred_ret},
         },
         title={"text":"다음날 예측 수익률","font":{"color":"#94a3b8","size":13}},
     ))
     fig.add_annotation(
         text=f"신뢰구간: {pred_ret-conf_band:+.2f}% ~ {pred_ret+conf_band:+.2f}%",
-        xref="paper", yref="paper", x=.5, y=-.1,
-        showarrow=False, font=dict(color="#64748b",size=11)
-    )
-    fig.update_layout(height=270, paper_bgcolor="#0f172a",
-        font=dict(color="#94a3b8"), margin=dict(l=20,r=20,t=60,b=55))
+        xref="paper",yref="paper",x=.5,y=-.1,
+        showarrow=False,font=dict(color="#64748b",size=11))
+    fig.update_layout(height=270,paper_bgcolor="#0f172a",
+        font=dict(color="#94a3b8"),margin=dict(l=20,r=20,t=60,b=55))
     return fig
 
 
 def plot_scan_bar(df):
     colors = ["#22c55e" if v>=0 else "#ef4444" for v in df["pred_ret_pct"]]
     fig = go.Figure(go.Bar(
-        x=df["name"], y=df["pred_ret_pct"], marker_color=colors,
-        text=[f"{v:+.1f}%" for v in df["pred_ret_pct"]], textposition="outside"
-    ))
-    fig.update_layout(
-        title="TOP10 예측 수익률 비교", height=300,
-        paper_bgcolor="#0f172a", plot_bgcolor="#0f172a",
-        font=dict(color="#94a3b8"),
+        x=df["name"],y=df["pred_ret_pct"],marker_color=colors,
+        text=[f"{v:+.1f}%" for v in df["pred_ret_pct"]],textposition="outside"))
+    fig.update_layout(title="TOP10 예측 수익률 비교",height=300,
+        paper_bgcolor="#0f172a",plot_bgcolor="#0f172a",font=dict(color="#94a3b8"),
         xaxis=dict(gridcolor="#1e293b"),
-        yaxis=dict(gridcolor="#1e293b", zeroline=True, zerolinecolor="#334155"),
-        margin=dict(l=10,r=10,t=50,b=10)
-    )
+        yaxis=dict(gridcolor="#1e293b",zeroline=True,zerolinecolor="#334155"),
+        margin=dict(l=10,r=10,t=50,b=10))
     return fig
+
+
+# ══════════════════════════════════════════════════════════════
+#  Gemma-4 자동 초기화 실행
+# ══════════════════════════════════════════════════════════════
+_token_for_init = _RAW_TOKEN   # Secrets에서 읽은 토큰
+
+if _token_for_init and not st.session_state.get("gemma_init_done"):
+    _conn = init_gemma(_token_for_init)
+    st.session_state["gemma_ok"]        = _conn["success"]
+    st.session_state["gemma_init_done"] = True
+    st.session_state["gemma_reply"]     = _conn.get("reply","")
+    st.session_state["gemma_error"]     = _conn.get("error","")
+    if _conn["success"]:
+        # 환경변수에 확정 저장
+        os.environ["HF_TOKEN"] = _token_for_init
 
 
 # ══════════════════════════════════════════════════════════════
@@ -221,38 +295,86 @@ def plot_scan_bar(df):
 with st.sidebar:
     st.markdown("## ⚙️ 설정")
 
-    # ── HF Token 입력 ────────────────────────────────────────
-    st.markdown("### 🤖 Gemma-4 설정")
+    # ── Gemma-4 상태 표시 (Secrets 기반) ─────────────────────
+    st.markdown("### 🤖 Gemma-4")
     st.caption(f"`{HF_MODEL}`")
 
-    token_input = st.text_input(
-        "HuggingFace API Token",
-        type="password",
-        placeholder="hf_xxxxxxxxxxxxxxxxxxxx",
-        help="HuggingFace → Settings → Access Tokens 에서 발급 (무료)"
-    )
-    if token_input:
-        st.session_state["hf_token"] = token_input
-
-    if has_token():
-        if st.button("🔌 연결 테스트", use_container_width=True):
-            with st.spinner("Gemma-4 연결 확인 중…"):
-                res = test_connection(hf_token())
-            if res["success"]:
-                st.success("✅ HF Router 연결 성공!")
-                st.info(f"💬 {res['reply']}")
-                st.session_state["gemma_ok"] = True
-            else:
-                st.error(f"❌ 연결 실패\n{res['error']}")
-                st.session_state["gemma_ok"] = False
-    else:
-        st.caption("토큰 입력 → 연결 테스트")
-
     gemma_ok = st.session_state.get("gemma_ok", False)
-    status_html = ('<span class="conn-ok">● Gemma-4 연결됨</span>'
-                   if gemma_ok else
-                   '<span style="color:#475569">○ 미연결</span>')
-    st.markdown(status_html, unsafe_allow_html=True)
+
+    if gemma_ok:
+        st.markdown(
+            f'<div class="secret-ok">'
+            f'✅ Gemma-4 연결됨<br>'
+            f'<span style="font-size:.75rem;opacity:.8">'
+            f'Secrets에서 토큰 자동 로드</span>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    elif _token_for_init:
+        err = st.session_state.get("gemma_error","알 수 없는 오류")
+        st.markdown(
+            f'<div class="secret-err">'
+            f'❌ 연결 실패<br>'
+            f'<span style="font-size:.75rem">{err}</span>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+        # 폴백: 수동 토큰 재입력 허용
+        with st.expander("🔑 토큰 수동 입력"):
+            manual_tok = st.text_input("HF Token",type="password",
+                                        placeholder="hf_xxxxxxxxxxxxx")
+            if st.button("재연결", use_container_width=True) and manual_tok:
+                with st.spinner("재연결 중…"):
+                    res2 = test_connection(manual_tok)
+                if res2["success"]:
+                    st.session_state["hf_token_override"] = manual_tok
+                    os.environ["HF_TOKEN"] = manual_tok
+                    st.session_state["gemma_ok"] = True
+                    st.session_state["gemma_error"] = ""
+                    st.success("✅ 연결 성공!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {res2['error']}")
+    else:
+        # Secrets 미설정 → 수동 입력 안내
+        st.markdown(
+            '<div class="secret-err">'
+            '⚠️ Secrets 미설정<br>'
+            '<span style="font-size:.75rem">'
+            'App Settings → Secrets에<br>HF_TOKEN 등록 필요</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+        with st.expander("🔑 토큰 직접 입력 (임시)"):
+            manual_tok = st.text_input("HF Token",type="password",
+                                        placeholder="hf_xxxxxxxxxxxxx")
+            if st.button("연결", use_container_width=True) and manual_tok:
+                with st.spinner("연결 테스트 중…"):
+                    res3 = test_connection(manual_tok)
+                if res3["success"]:
+                    st.session_state["hf_token_override"] = manual_tok
+                    os.environ["HF_TOKEN"] = manual_tok
+                    st.session_state["gemma_ok"] = True
+                    st.session_state["gemma_init_done"] = True
+                    st.success("✅ 연결 성공!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {res3['error']}")
+
+    # Secrets 설정 가이드
+    with st.expander("📋 Secrets 설정 방법"):
+        st.code("""
+# Streamlit Cloud
+# App Settings → Secrets → 아래 내용 붙여넣기:
+
+LLM_ENGINE      = "hf_api"
+HF_TOKEN        = "hf_your_token_here"
+HF_MODEL_ID     = "google/gemma-4-26B-A4B-it"
+HF_MAX_TOKENS   = "1200"
+HF_TEMPERATURE  = "0.2"
+""", language="toml")
+        st.caption("로컬: `.streamlit/secrets.toml` 에 동일하게 저장")
+
     st.markdown("---")
 
     # ── 모드 선택 ─────────────────────────────────────────────
@@ -289,15 +411,21 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════
-#  헤더
+#  메인 헤더
 # ══════════════════════════════════════════════════════════════
+gemma_ok = st.session_state.get("gemma_ok", False)   # 최신값 재확인
+
 st.markdown('<div class="main-title">🚀 KR NextDay Surge Predictor + Gemma-4</div>',
             unsafe_allow_html=True)
-g_badge = (f'<span style="color:#a78bfa;font-size:.85rem">● {HF_MODEL} 연결됨</span>'
-           if gemma_ok else
-           '<span style="color:#475569;font-size:.85rem">○ Gemma-4 미연결</span>')
-st.markdown(f'<div class="sub-title">KOSPI+KOSDAQ │ 앙상블 ML │ 다음날 수익률 예측 &nbsp; {g_badge}</div>',
-            unsafe_allow_html=True)
+g_badge = (
+    f'<span style="color:#a78bfa;font-size:.85rem">● {HF_MODEL} 연결됨</span>'
+    if gemma_ok else
+    '<span style="color:#ef4444;font-size:.85rem">○ Gemma-4 미연결</span>'
+)
+st.markdown(
+    f'<div class="sub-title">KOSPI+KOSDAQ │ 앙상블 ML │ 다음날 수익률 예측 &nbsp; {g_badge}</div>',
+    unsafe_allow_html=True
+)
 
 agent = get_agent()
 
@@ -317,7 +445,7 @@ if "단일" in mode:
             st.markdown(f"### {r['name']}  `{r['ticker']}`  {r['market']}")
             st.markdown("---")
 
-            # ── 핵심 예측 카드 5개 ───────────────────────────
+            # 예측 핵심 카드 5개
             pr = r["pred_ret_pct"]; cb = r["conf_band"]
             col_c = "up-color" if pr >= 0 else "down-color"
 
@@ -325,19 +453,19 @@ if "단일" in mode:
             c1.markdown(mc("예측 수익률",   f"{pr:+.2f}%",
                            f"± {cb:.2f}%", col_c), unsafe_allow_html=True)
             c2.markdown(mc("예측 상승률",   f"+{r['pred_up_pct']:.2f}%",
-                           f"과거평균 {r['up_hist_avg'] or '-'}%",
-                           "up-color"), unsafe_allow_html=True)
+                           f"과거평균 {r['up_hist_avg'] or '-'}%","up-color"),
+                        unsafe_allow_html=True)
             c3.markdown(mc("예측 하락률",   f"-{r['pred_dn_pct']:.2f}%",
-                           f"과거평균 -{r['dn_hist_avg'] or '-'}%",
-                           "down-color"), unsafe_allow_html=True)
+                           f"과거평균 -{r['dn_hist_avg'] or '-'}%","down-color"),
+                        unsafe_allow_html=True)
             c4.markdown(mc("15% 급등 확률", f"{r['prob_up15']*100:.1f}%",
-                           f"과거 {r['pos_count']}회",
-                           "neu-color"), unsafe_allow_html=True)
+                           f"과거 {r['pos_count']}회","neu-color"),
+                        unsafe_allow_html=True)
             c5.markdown(mc("급등 점수",     f"{r['score']:.1f}",
                            "/ 100", col_c), unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
 
-            # ── 방향 배지 + 패턴 태그 ───────────────────────
+            # 방향 배지 + 패턴 태그
             st.markdown(
                 dir_badge(r["direction"]) + "&nbsp;&nbsp;" +
                 tag("🔥 거래량폭발", r["vol_explosion"]) +
@@ -348,19 +476,19 @@ if "단일" in mode:
             )
             st.markdown("<br>", unsafe_allow_html=True)
 
-            # ── 게이지 + 캔들 차트 ──────────────────────────
+            # 게이지 + 캔들 차트
             ga, ca = st.columns([1,2])
             with ga:
                 st.plotly_chart(plot_gauge(pr, cb), use_container_width=True)
             with ca:
                 st.plotly_chart(plot_candle(r["raw"], r), use_container_width=True)
 
-            # ── 기술적 지표 ──────────────────────────────────
+            # 기술적 지표
             st.markdown("#### 🔬 기술적 지표")
             ia, ib, ic = st.columns(3)
             with ia:
                 st.metric("RSI(14)",          f"{r['rsi14']:.1f}")
-                st.metric("BB 위치",           f"{r['bb_pos']:.2f}  (0=하단 / 1=상단)")
+                st.metric("BB 위치",           f"{r['bb_pos']:.2f}")
                 st.metric("ATR 비율",          f"{r['atr_ratio']*100:.2f}%")
             with ib:
                 st.metric("거래량 비율(20일)", f"{r['vol_ratio20']:.2f}x")
@@ -370,19 +498,23 @@ if "단일" in mode:
                 st.metric("52주 신고가 거리",  f"{r['dist_52w_high']*100:.1f}%")
                 st.metric("MACD Gap",          f"{r['macd_gap']:.4f}")
                 cv = r["cv_auc"]
-                st.metric("CV AUC (분류)",     f"{cv:.3f}" if cv else "N/A")
+                st.metric("CV AUC",            f"{cv:.3f}" if cv else "N/A")
 
-            # ── Gemma-4 AI 분석 리포트 (스트리밍) ───────────
+            # Gemma-4 AI 분석 리포트
             if use_llm and gemma_ok:
                 st.markdown("---")
                 st.markdown(f"""
 <div class="gemma-box">
   <div class="gemma-header">🤖 Gemma-4 AI 분석 리포트 &nbsp;·&nbsp; {HF_MODEL}</div>
 """, unsafe_allow_html=True)
-                ph = st.empty()
-                full = ""
+                ph = st.empty(); full = ""
                 try:
-                    gen = analyze_stock_with_gemma(r, hf_token(), stream=True)
+                    tok = get_token()
+                    gen = analyze_stock_with_gemma(
+                        r, tok, stream=True,
+                        max_tokens=HF_MAX_TOKENS,
+                        temperature=HF_TEMPERATURE
+                    )
                     for chunk in gen:
                         full += chunk
                         ph.markdown(full + "▌")
@@ -390,16 +522,15 @@ if "단일" in mode:
                 except Exception as e:
                     ph.error(f"Gemma-4 오류: {e}")
                 st.markdown("</div>", unsafe_allow_html=True)
-
             elif use_llm and not gemma_ok:
-                st.info("💡 Gemma-4 AI 분석을 사용하려면 사이드바에서 HF 토큰을 입력하세요.")
+                st.info("💡 Secrets에 HF_TOKEN을 등록하면 AI 분석이 자동 활성화됩니다.")
 
-            # ── 모델 메타 ────────────────────────────────────
-            with st.expander("🤖 모델 정보"):
+            # 모델 메타
+            with st.expander("🤖 ML 모델 정보"):
                 mm1,mm2,mm3 = st.columns(3)
-                mm1.metric("CV AUC (분류)",  r["cv_auc"] or "N/A")
+                mm1.metric("CV AUC (분류)",   r["cv_auc"] or "N/A")
                 mm2.metric("CV Score (회귀)", r["cv_reg"] or "N/A")
-                mm3.metric("과거 15%↑ 발생률", f"{r['base_rate']*100:.1f}%")
+                mm3.metric("과거 15%↑ 발생률",f"{r['base_rate']*100:.1f}%")
                 st.caption(f"모델: {r['model_info']}  |  분석시각: {r['analyzed_at']}")
 
     elif run_btn:
@@ -412,7 +543,6 @@ if "단일" in mode:
 | `삼성전자` | 종목명 한글 |
 | `005930` | 종목 코드 6자리 |
 | `하이닉스` | 부분 이름 퍼지 검색 |
-| `카카오` | 부분 이름 |
 """)
 
 
@@ -437,7 +567,6 @@ elif "TOP10" in mode:
         else:
             st.session_state["last_scan"] = df
             st.success(f"✅ {scan_n}개 종목 스캔 완료 → TOP{top_n} 추출")
-
             st.plotly_chart(plot_scan_bar(df), use_container_width=True)
 
             # 상세 테이블
@@ -474,7 +603,7 @@ elif "TOP10" in mode:
                 }, na_rep="N/A")
             st.dataframe(styled, use_container_width=True, height=400)
 
-            # ── Gemma-4 종합 시장 판단 ───────────────────────
+            # Gemma-4 종합 시장 판단
             if use_llm and gemma_ok:
                 st.markdown("---")
                 st.markdown(f"""
@@ -483,7 +612,12 @@ elif "TOP10" in mode:
 """, unsafe_allow_html=True)
                 ph = st.empty(); full = ""
                 try:
-                    gen = analyze_top10_with_gemma(df, hf_token(), stream=True)
+                    tok = get_token()
+                    gen = analyze_top10_with_gemma(
+                        df, tok, stream=True,
+                        max_tokens=HF_MAX_TOKENS,
+                        temperature=HF_TEMPERATURE
+                    )
                     for chunk in gen:
                         full += chunk
                         ph.markdown(full + "▌")
@@ -501,9 +635,9 @@ elif "TOP10" in mode:
                     r2 = agent.analyze(sel, use_realtime=use_rt)
                 if r2:
                     st.session_state["last_result"] = r2
-                    pr2 = r2["pred_ret_pct"]; cb2 = r2["conf_band"]
                     d1,d2,d3 = st.columns(3)
-                    d1.metric("예측 수익률",   f"{pr2:+.2f}%", f"±{cb2:.2f}%")
+                    d1.metric("예측 수익률",   f"{r2['pred_ret_pct']:+.2f}%",
+                              f"±{r2['conf_band']:.2f}%")
                     d2.metric("15% 급등 확률", f"{r2['prob_up15']*100:.1f}%")
                     d3.metric("급등 점수",     f"{r2['score']:.1f}/100")
                     st.plotly_chart(plot_candle(r2["raw"], r2), use_container_width=True)
@@ -515,7 +649,12 @@ elif "TOP10" in mode:
 """, unsafe_allow_html=True)
                         ph3 = st.empty(); full3 = ""
                         try:
-                            gen3 = analyze_stock_with_gemma(r2, hf_token(), stream=True)
+                            tok = get_token()
+                            gen3 = analyze_stock_with_gemma(
+                                r2, tok, stream=True,
+                                max_tokens=HF_MAX_TOKENS,
+                                temperature=HF_TEMPERATURE
+                            )
                             for chunk in gen3:
                                 full3 += chunk
                                 ph3.markdown(full3 + "▌")
@@ -538,26 +677,35 @@ elif "TOP10" in mode:
 # ══════════════════════════════════════════════════════════════
 else:
     st.markdown("### 💬 Gemma-4 주식 AI 챗봇")
-    st.caption(f"모델: `{HF_MODEL}` │ 분석한 종목 컨텍스트 자동 연동")
+    st.caption(f"모델: `{HF_MODEL}` │ max_tokens={HF_MAX_TOKENS} │ temperature={HF_TEMPERATURE}")
 
     if not gemma_ok:
-        st.warning("⚠️ 사이드바에서 HuggingFace API 토큰을 입력하고 연결 테스트를 완료해 주세요.")
+        st.warning(
+            "⚠️ Gemma-4가 연결되지 않았습니다. "
+            "Streamlit Cloud → App Settings → Secrets에 HF_TOKEN을 등록해 주세요."
+        )
+        st.code("""
+LLM_ENGINE      = "hf_api"
+HF_TOKEN        = "hf_your_token_here"
+HF_MODEL_ID     = "google/gemma-4-26B-A4B-it"
+HF_MAX_TOKENS   = "1200"
+HF_TEMPERATURE  = "0.2"
+""", language="toml")
         st.stop()
 
     # 세션 초기화
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
 
-    # 컨텍스트 표시
+    # 컨텍스트 (마지막 분석 종목)
     ctx = st.session_state.get("last_result", None)
     if ctx:
         st.info(
             f"📌 현재 컨텍스트: **{ctx['name']}** "
-            f"(예측: {ctx['pred_ret_pct']:+.2f}% │ 점수: {ctx['score']:.1f}점) "
-            f"— 단일 분석 탭에서 다른 종목 분석 시 자동 변경"
+            f"(예측: {ctx['pred_ret_pct']:+.2f}% │ 점수: {ctx['score']:.1f}점)"
         )
     else:
-        st.caption("💡 '단일 종목 분석' 탭에서 종목을 분석하면 컨텍스트가 자동으로 연동됩니다.")
+        st.caption("💡 '단일 종목 분석' 탭에서 종목을 분석하면 컨텍스트가 자동 연동됩니다.")
 
     # 채팅 히스토리 출력
     for msg in st.session_state["chat_history"]:
@@ -608,12 +756,15 @@ else:
         full_reply = ""
         try:
             hist = st.session_state["chat_history"][:-1][-6:]
+            tok  = get_token()
             gen  = chat_with_gemma(
-                question  = question,
-                hf_token  = hf_token(),
-                history   = hist,
-                context   = ctx,
-                stream    = True,
+                question    = question,
+                hf_token    = tok,
+                history     = hist,
+                context     = ctx,
+                stream      = True,
+                max_tokens  = HF_MAX_TOKENS,
+                temperature = HF_TEMPERATURE,
             )
             for chunk in gen:
                 full_reply += chunk
